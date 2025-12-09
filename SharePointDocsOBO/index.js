@@ -2,7 +2,7 @@ const { Buffer } = require('buffer');
 const path = require('path');
 
 //Import utilities
-const { getGraphToken, sendResponse} = require('../shared/utilities');
+const { getGraphToken, sendResponse} = require('../shared/utilities-obo');
 
 //Import Graph client initialization
 const { initGraphClient } = require('../shared/graph-client');

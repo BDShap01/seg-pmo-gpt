@@ -4,9 +4,6 @@ const path = require('path');
 //Import utilities
 const { getGraphToken, sendResponse} = require('../shared/utilities');
 
-//Import client authorization
-// const { getOboToken, getServiceAccountToken, getAccessToken } = require('../shared/sharepoint-auth');
-
 //Import Graph client initialization
 const { initGraphClient } = require('../shared/graph-client');
 
@@ -14,19 +11,15 @@ const { initGraphClient } = require('../shared/graph-client');
 // Function to fetch drive item content and convert to text
 const getDriveItemContent = async (client, driveId, itemId, name) => {
     try {
-        // const fileType = path.extname(name).toLowerCase();
-        // the below files types are the ones that are able to be converted to PDF to extract the text. See https://learn.microsoft.com/en-us/graph/api/driveitem-get-content-format?view=graph-rest-1.0&tabs=http
-        // const allowedFileTypes = ['.pdf', '.doc', '.docx', '.odp', '.ods', '.odt', '.pot', '.potm', '.potx', '.pps', '.ppsx', '.ppsxm', '.ppt', '.pptm', '.pptx', '.rtf'];
-        // filePath changes based on file type, adding ?format=pdf to convert non-pdf types to pdf for text extraction, so all files in allowedFileTypes above are converted to pdf
         const filePath = `/drives/${driveId}/items/${itemId}`;
         const downloadPath = filePath + `/content`
       
         try{
             const fileStream = await client.api(downloadPath).getStream();
             let chunks = [];
-                for await (let chunk of fileStream) {
-                    chunks.push(chunk);
-                }
+            for await (let chunk of fileStream) {
+                chunks.push(chunk);
+            }
             const base64String = Buffer.concat(chunks).toString('base64');
             const file = await client.api(filePath).get();
             const mime_type = file.file.mimeType;
@@ -71,72 +64,85 @@ const getDriveItemMetadata = async (client, driveId, itemId, name) => {
 module.exports = async function (context, req) {
     const debug = {};
    
-    const searchTerm = req.query.searchTerm || (req.body && req.body.searchTerm);
-    debug.searchTerm = searchTerm;
-
-    let graphToken;
     try {
-        graphToken = await getGraphToken(req, context, debug);
-    } catch (error) {
-        return sendResponse(context, debug, 500, `Error generating Graph token: ${error.message}`);
-    }
+        const searchTerm = req.query.searchTerm || (req.body && req.body.searchTerm);
+        debug.searchTerm = searchTerm;
+        debug.step = "1-params-parsed";
 
-    // Initialize the Graph Client using the initGraphClient function defined above
-    let client = initGraphClient(graphToken);
-    // this is the search body to be used in the Microsft Graph Search API: https://learn.microsoft.com/en-us/graph/search-concept-files
-    const requestBody = {
-        requests: [
-            {
-                entityTypes: ['driveItem'],
-                query: {
-                    queryString: searchTerm
-                },
-                from: 0,
-                // the below is set to summarize the top 10 search results from the Graph API, but can configure based on your documents. 
-                size: 10
-            }
-        ]
-    };
-    debug.requestBody = requestBody
+        let graphToken;
+        try {
+            graphToken = await getGraphToken(req, context, debug);
+            debug.step = "2-token-acquired";
+        } catch (error) {
+            debug.step = "2-token-failed";
+            return sendResponse(context, debug, 500, `Error generating Graph token: ${error.message}`);
+        }
 
-    try { 
+        // Initialize the Graph Client
+        let client = initGraphClient(graphToken);
+        debug.step = "3-client-initialized";
+        
+        const requestBody = {
+            requests: [
+                {
+                    entityTypes: ['driveItem'],
+                    query: {
+                        queryString: searchTerm
+                    },
+                    from: 0,
+                    size: 10
+                }
+            ]
+        };
+        debug.requestBody = requestBody;
+        debug.step = "4-request-body-created";
+
         // This is where we are doing the search
         const list = await client.api('/search/query').post(requestBody);
+        debug.step = "5-search-completed";
+        debug.totalHits = list.value[0].hitsContainers[0].total;
 
         const processList = async () => {
-            // Loop through each search response to retreive desired file data
             const results = [];
 
-            await Promise.all(list.value[0].hitsContainers.map(async (container) => {
-                for (const hit of container.hits) {
+            // FIXED: Proper Promise.all usage
+            for (const container of list.value[0].hitsContainers) {
+                const hitPromises = container.hits.map(async (hit) => {
                     if (hit.resource["@odata.type"] === "#microsoft.graph.driveItem") {
                         const { name, id } = hit.resource;
                         const driveId = hit.resource.parentReference.driveId;
-                        // const fileData = await getDriveItemContent(client, driveId, id, name);
-                        const fileData = await getDriveItemMetadata(client, driveId, id, name);
-                        results.push(fileData)
+                        return await getDriveItemMetadata(client, driveId, id, name);
                     }
-                }
-            }));
+                    return null;
+                });
+                
+                const hitResults = await Promise.all(hitPromises);
+                results.push(...hitResults.filter(r => r !== null));
+            }
 
             return results;
         };
+        
         let results;
         if (list.value[0].hitsContainers[0].total == 0) {
-            // Return no results found to the API if the Microsoft Graph API returns no results
+            debug.step = "6-no-results";
             results = { message: 'No results found', openaiFileResponse: [] };
         } else {
-            // If the Microsoft Graph API does return results, then run processList to iterate through.
+            debug.step = "6-processing-results";
             results = await processList();
+            debug.step = "7-processing-complete";
             results = {'openaiFileResponse': results}
-            // results.sort((a, b) => a.rank - b.rank);
         }
 
         debug.results = results;
+        debug.step = "8-success";
         return sendResponse(context, debug);
-        // return sendResponse(context, results); // final success return
 
     } catch (error) {
-        return sendResponse(context, debug, 500, `Error performing search or processing results: ${error.message}`);
+        debug.step = "ERROR";
+        debug.errorMessage = error.message;
+        debug.errorStack = error.stack;
+        console.error("FATAL ERROR in SharePointDocs:", error);
+        return sendResponse(context, debug, 500, `Error: ${error.message}`);
     }
 };
